@@ -1,1 +1,9 @@
 /target
+
+# System / Log files
+*.DS_Store
+*.log
+logs
+
+### codegraph ###
+.codegraph/
