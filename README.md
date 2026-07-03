@@ -1,6 +1,6 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/Doctor_banner.png">
-  <img alt="Doctor Banner" src="assets/Doctor_banner.png">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/banner.png">
+  <img alt="Doctor Banner" src="assets/banner.png">
 </picture>
 
 # Doctor
