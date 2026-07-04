@@ -1,0 +1,8 @@
+# Clippy configuration for Doctor diagnostic engine
+# Run: cargo clippy -- -D warnings
+
+# Warn on all clippy lints by default, explicitly allow project-specific ones
+# (we use -D warnings in CI, so any warn-level lint becomes an error)
+
+# Allow: too many arguments can be justified for rule diagnostic functions
+# that need access to model + evidence + context
