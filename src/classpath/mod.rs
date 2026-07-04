@@ -46,7 +46,8 @@ pub fn discover_auto_config_beans(project_path: &Path) -> DoctorResult<Vec<AutoC
     eprintln!("  Auto-config cache: miss, scanning jars...");
 
     // Full scan
-    let class_names = jar_scanner::discover_auto_config_classes()?;
+    let global_index = jar_scanner::build_class_index();
+    let class_names = jar_scanner::discover_auto_config_classes_with_index(&global_index)?;
     let mut beans = Vec::new();
     let mut parsed_count = 0;
     let mut bean_total = 0;
@@ -65,7 +66,7 @@ pub fn discover_auto_config_beans(project_path: &Path) -> DoctorResult<Vec<AutoC
                         for bean in parsed.beans {
                             // Look up the @Bean return type's .class to extract its interfaces
                             let return_interfaces: Vec<String> = if !bean.bean_type_fqcn.is_empty() {
-                                resolve_interfaces_for_type(&class_names, &bean.bean_type_fqcn)
+                                resolve_interfaces_for_type(&class_names, &global_index, &bean.bean_type_fqcn)
                                     .unwrap_or_default()
                             } else {
                                 vec![]
@@ -99,11 +100,36 @@ pub fn discover_auto_config_beans(project_path: &Path) -> DoctorResult<Vec<AutoC
         }
     }
 
+    // Phase 2: Scan ALL @Configuration classes in global index
+    // Catches framework beans not in AutoConfiguration.imports
+    let mut phase2 = 0usize;
+    for (fqcn, jar_path) in &global_index {
+        let simple = fqcn.rsplit('.').next().unwrap_or(fqcn);
+        if !simple.ends_with("Configuration") { continue; }
+        if class_names.iter().any(|(cn, _)| cn == fqcn) { continue; }
+        if let Ok(class_bytes) = jar_scanner::read_class_from_jar(jar_path, fqcn) {
+            if let Ok(parsed) = class_parser::parse_class(&class_bytes) {
+                phase2 += 1;
+                for bean in &parsed.beans {
+                    let ifaces = if bean.bean_type_fqcn.is_empty() { vec![] }
+                        else { resolve_interfaces_for_type(&class_names, &global_index, &bean.bean_type_fqcn).unwrap_or_default() };
+                    beans.push(AutoConfigBean {
+                        bean_name: bean.bean_name.clone(),
+                        class_name: bean.bean_type.clone(),
+                        source_class: parsed.class_name.clone(),
+                        discovery_method: bean.discovery_method,
+                        interfaces: ifaces,
+                    });
+                }
+            }
+        }
+    }
+
     // Dedup by (bean_name, class_name)
     beans.sort_by(|a, b| a.bean_name.cmp(&b.bean_name).then(a.class_name.cmp(&b.class_name)));
     beans.dedup_by(|a, b| a.bean_name == b.bean_name && a.class_name == b.class_name);
 
-    eprintln!("  Parsed {parsed_count} classes, found {bean_total} beans total");
+    eprintln!("  Parsed {parsed_count} auto-config + {phase2} framework classes, found {bean_total} beans total");
     // Save cache
     if let Err(e) = cache::save_cache(&cache_key, &beans) {
         eprintln!("  Warning: failed to save cache: {e}");
@@ -115,14 +141,24 @@ pub fn discover_auto_config_beans(project_path: &Path) -> DoctorResult<Vec<AutoC
 /// Look up the .class file for a Bean return type and extract its interfaces.
 fn resolve_interfaces_for_type(
     class_names: &[(String, String)],
+    global_index: &std::collections::HashMap<String, String>,
     fqcn: &str,
 ) -> Option<Vec<String>> {
+    // Direct match: class listed in auto-config imports
     for (jar_path, cls) in class_names {
         if cls == fqcn {
             if let Ok(class_bytes) = jar_scanner::read_class_from_jar(jar_path, cls) {
                 if let Ok(parsed) = class_parser::parse_class(&class_bytes) {
                     return Some(parsed.interfaces);
                 }
+            }
+        }
+    }
+    // Fallback: try global jar index (178K classes)
+    if let Some(jar_path) = global_index.get(fqcn) {
+        if let Ok(class_bytes) = jar_scanner::read_class_from_jar(jar_path, fqcn) {
+            if let Ok(parsed) = class_parser::parse_class(&class_bytes) {
+                return Some(parsed.interfaces);
             }
         }
     }

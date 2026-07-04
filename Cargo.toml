@@ -25,6 +25,9 @@ regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 toml = "0.8"
+tree-sitter = "0.26"
+tree-sitter-java = "0.23"
+sled = "0.34"
 
 [dev-dependencies]
 tempfile = "3"

@@ -87,7 +87,7 @@ fn scan_jar_classes(jar_path: &str) -> Vec<String> {
 }
 
 /// Build a global class_name → jar_path index across all jars.
-fn build_class_index() -> HashMap<String, String> {
+pub fn build_class_index() -> HashMap<String, String> {
     let mut index = HashMap::new();
     let Ok(home) = std::env::var("HOME") else { return index; };
 
@@ -108,6 +108,35 @@ fn build_class_index() -> HashMap<String, String> {
         }
     }
     index
+}
+
+/// Discover auto-config classes using a pre-built class index.
+pub fn discover_auto_config_classes_with_index(
+    class_index: &HashMap<String, String>,
+) -> DoctorResult<Vec<(String, String)>> {
+    let mut results = Vec::new();
+    let Ok(home) = std::env::var("HOME") else { return Ok(results) };
+    let mut seen = std::collections::HashSet::new();
+
+    for dir in [
+        Path::new(&home).join(".gradle/caches/modules-2/files-2.1"),
+        Path::new(&home).join(".m2/repository"),
+    ] {
+        if !dir.exists() { continue; }
+        for entry in walkdir::WalkDir::new(&dir)
+            .max_depth(8).into_iter().filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "jar"))
+        {
+            let jar_path = entry.path().display().to_string();
+            for class_name in scan_jar_classes(&jar_path) {
+                if !seen.insert(class_name.clone()) { continue; }
+                if let Some(resolved_jar) = class_index.get(&class_name) {
+                    results.push((class_name, resolved_jar.clone()));
+                }
+            }
+        }
+    }
+    Ok(results)
 }
 
 /// Discover auto-config classes and their locations.

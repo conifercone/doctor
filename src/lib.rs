@@ -11,5 +11,6 @@ pub mod evidence;
 pub mod model;
 pub mod output;
 pub mod plugin;
+pub mod psi;
 pub mod rule_engine;
 pub mod scanner;

@@ -265,6 +265,96 @@ impl ImportResolver {
 // Public entry point
 // ---------------------------------------------------------------------------
 
+/// Build a BeanGraph using the tree-sitter PSI pipeline.
+fn build_bean_graph_psi(project_path: &Path) -> DoctorResult<BeanGraph> {
+    let java_source_dirs = collect_java_source_dirs(project_path)?;
+    let mut all_classes = Vec::new();
+
+    // Try incremental scan with sled index
+    let db = crate::psi::index::open_db().ok();
+    let mut reparse_count = 0usize;
+    let mut cache_hit_count = 0usize;
+
+    for dir in java_source_dirs.iter() {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "java"))
+        {
+            let file_path = entry.path();
+            let content = std::fs::read_to_string(file_path).unwrap_or_default();
+
+            // Check if file is unchanged (incremental scan)
+            if let Some(ref db) = db {
+                if !crate::psi::index::file_changed(db, &file_path.display().to_string(), &content)
+                {
+                    let cached = crate::psi::index::read_classes_from_file(
+                        db,
+                        &file_path.display().to_string(),
+                    );
+                    if !cached.is_empty() {
+                        all_classes.extend(cached);
+                        cache_hit_count += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Cache miss or no db: parse with tree-sitter
+            match crate::psi::ast::parse_file(file_path) {
+                Ok(classes) => {
+                    if let Some(ref db) = db {
+                        for cls in &classes {
+                            if let Err(e) = crate::psi::index::write_class(db, cls) {
+                                eprintln!("  Warning: sled write: {e}");
+                            }
+                        }
+                        // Store file→FQCNs mapping for incremental cache
+                        let fqcns: Vec<&str> = classes.iter().map(|c| c.fqcn.as_str()).collect();
+                        let _ = db.insert(
+                            format!("F:{}", file_path.display()),
+                            fqcns.join(",").as_bytes(),
+                        );
+                        let hash = crate::psi::index::compute_hash(&content);
+                        let _ = crate::psi::index::store_file_hash(
+                            db,
+                            &file_path.display().to_string(),
+                            &hash,
+                        );
+                    }
+                    all_classes.extend(classes);
+                    reparse_count += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  Warning: PSI parse failed for {}: {e}",
+                        file_path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    if cache_hit_count > 0 || reparse_count > 0 {
+        eprintln!(
+            "  PSI: {reparse_count} files parsed, {cache_hit_count} cached (sled)"
+        );
+    }
+
+    if all_classes.is_empty() {
+        return Err(DoctorError::ParseError {
+            file: project_path.display().to_string(),
+            message: "PSI parser found 0 classes".to_string(),
+        });
+    }
+
+    let graph = crate::psi::bean_collector::collect_beans(&all_classes);
+    Ok(graph)
+}
+
 /// Build a `BeanGraph` by scanning all Java source files in the given
 /// project directory (including multi-module Gradle projects).
 ///
@@ -274,38 +364,33 @@ impl ImportResolver {
 /// read.  Individual file parse failures are logged and skipped rather than
 /// causing the entire build to fail.
 pub fn build_bean_graph(project_path: &Path) -> DoctorResult<BeanGraph> {
-    let mut graph = BeanGraph::new();
-    let java_source_dirs = collect_java_source_dirs(project_path)?;
-
-    for dir in &java_source_dirs {
-        if !dir.exists() {
-            continue;
+    // Use tree-sitter PSI pipeline for accurate parsing
+    let mut graph = match build_bean_graph_psi(project_path) {
+        Ok(g) if !g.beans.is_empty() => {
+            eprintln!("  PSI: {} beans parsed via tree-sitter", g.beans.len());
+            g
         }
-
-        for entry in WalkDir::new(dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "java"))
-        {
-            let file_path = entry.path();
-            if let Err(e) = process_java_file(file_path, dir, &mut graph) {
-                eprintln!(
-                    "warning: skipping `{}` — {}",
-                    file_path.display(),
-                    e
-                );
-            }
+        Ok(_) => {
+            eprintln!("  Warning: PSI parser found 0 beans, falling back to regex");
+            let mut g = BeanGraph::new();
+            let java_source_dirs = collect_java_source_dirs(project_path)?;
+            build_graph_regex(&mut g, &java_source_dirs)?;
+            g
         }
-    }
+        Err(e) => {
+            eprintln!("  Warning: PSI parser failed: {e}, falling back to regex");
+            let mut g = BeanGraph::new();
+            let java_source_dirs = collect_java_source_dirs(project_path)?;
+            build_graph_regex(&mut g, &java_source_dirs)?;
+            g
+        }
+    };
 
-    // Discover auto-configuration beans from dependency jars
+    // Register auto-config beans (runs for both PSI and regex paths)
     match crate::classpath::discover_auto_config_beans(project_path) {
         Ok(auto_beans) => {
             let count = auto_beans.len();
             for ab in &auto_beans {
-                // Use class_name as primary name: dependency edges reference type names,
-                // and @Bean method names may differ from the type they produce.
-                // Register interface→impl mappings
                 for iface in &ab.interfaces {
                     graph.add_interface_impl(iface.clone(), ab.class_name.clone());
                 }
@@ -330,13 +415,40 @@ pub fn build_bean_graph(project_path: &Path) -> DoctorResult<BeanGraph> {
     Ok(graph)
 }
 
+/// Legacy regex-based graph builder (kept for fallback).
+fn build_graph_regex(graph: &mut BeanGraph, java_source_dirs: &[PathBuf]) -> DoctorResult<()> {
+
+    for dir in java_source_dirs.iter() {
+        if !dir.exists() {
+            continue;
+        }
+
+        for entry in WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "java"))
+        {
+            let file_path = entry.path();
+            if let Err(e) = process_java_file(file_path, dir, graph) {
+                eprintln!(
+                    "warning: skipping `{}` — {}",
+                    file_path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Source directory collection (with multi-module support)
 // ---------------------------------------------------------------------------
 
 /// Collect all `src/main/java` directories across the root module and any
 /// Gradle submodules declared in `settings.gradle.kts` or `settings.gradle`.
-fn collect_java_source_dirs(project_path: &Path) -> DoctorResult<Vec<PathBuf>> {
+pub fn collect_java_source_dirs(project_path: &Path) -> DoctorResult<Vec<PathBuf>> {
     let mut dirs: Vec<PathBuf> = Vec::new();
 
     // Root module

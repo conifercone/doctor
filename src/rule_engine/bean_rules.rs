@@ -17,16 +17,40 @@ pub fn detect_missing_beans(
         model.bean_graph.beans.iter().map(|b| b.name.as_str()).collect();
     let bean_classes: HashSet<&str> =
         model.bean_graph.beans.iter().map(|b| b.class_name.as_str()).collect();
+    // Simple name lookups for FQCN→simple matching
+    let bean_simple_names: HashSet<String> =
+        model.bean_graph.beans.iter()
+            .map(|b| b.class_name.rsplit('.').next().unwrap_or(&b.class_name).to_string())
+            .collect();
 
     // Interface → implementation matching
     let interface_impls = &model.bean_graph.interface_impls;
 
+    /// Framework types always available via Spring container (never "missing")
+    const ALWAYS_AVAILABLE: &[&str] = &[
+        "String", "List", "Map", "Set", "Object", "ObjectProvider",
+        "ApplicationContext", "ResourceLoader", "HttpServletRequest",
+        "HttpServletResponse", "HttpSession", "HttpSecurity", "GrpcSecurity",
+    ];
+
     for (i, bean) in model.bean_graph.beans.iter().enumerate() {
         for dep in &bean.dependencies {
+            let dep_simple = dep.rsplit('.').next().unwrap_or(dep);
+
+            // 0. Skip framework types always available via Spring
+            if ALWAYS_AVAILABLE.contains(&dep_simple)
+                || ALWAYS_AVAILABLE.contains(&dep.as_str())
+            {
+                continue;
+            }
+
             let mut found = false;
 
-            // 1. Direct name/class match
-            if bean_names.contains(dep.as_str()) || bean_classes.contains(dep.as_str()) {
+            // 1. Direct name/class match (FQCN or simple name)
+            if bean_names.contains(dep.as_str())
+                || bean_classes.contains(dep.as_str())
+                || bean_simple_names.contains(dep_simple)
+            {
                 found = true;
             }
 
